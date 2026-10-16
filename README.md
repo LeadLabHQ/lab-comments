@@ -11,7 +11,7 @@ free plans, so for a small site it costs nothing.
 [leadlabhq.com](https://leadlabhq.com). Post a comment there and you
 have tried it.
 
-Two words you will meet below:
+Three words you will meet below:
 
 - A **Worker** is a small piece of code that runs on Cloudflare's
   computers, not on yours. It takes in comments and hands them back out.
@@ -46,27 +46,62 @@ You need a free [Cloudflare](https://www.cloudflare.com) account, your
 site on Cloudflare Pages, and Wrangler — Cloudflare's free
 command-line tool. About 10 minutes, in this order:
 
+**0. Before you start.**
+
+- **Get the files.** On this repo's GitHub page, click the green
+  **Code** button, then **Download ZIP**. Unzip it, and open that
+  folder in a terminal. (Never used a terminal? It is the text window
+  where you type the commands below. On Windows, open the folder,
+  right-click inside it, and pick "Open in Terminal." On a Mac,
+  right-click the folder and pick "New Terminal at Folder" under
+  Services.)
+- **Install Node.js.** Wrangler runs on Node.js. Get Node.js free
+  from [nodejs.org](https://nodejs.org) and install it like any
+  other program. Close and reopen your terminal when it finishes.
+- **Install Wrangler.** In the terminal, in that unzipped folder,
+  run:
+
+  ```bash
+  npm i -D wrangler@latest
+  ```
+
+- **Log in.** Run this, and when your browser opens a Cloudflare
+  page, click **Allow**. That connects Wrangler to your account:
+
+  ```bash
+  npx wrangler login
+  ```
+
+One shortcut to know: the steps below write commands starting with
+`wrangler` to keep them short. Because you installed Wrangler into
+this folder, type `npx ` in front of each one — like the
+`npx wrangler login` you just ran.
+
 **1. Create the database.**
 
 ```bash
 wrangler d1 create lab-comments
 ```
 
-Wrangler prints a `database_id`. Keep it for step 3.
+Wrangler prints a `database_id`. Copy it into a note — you will
+paste it in step 3.
 
-**2. Make the table.**
+**2. Make the table (you can skip this one).**
+
+You can skip this step — the Worker creates the table on its own
+the first time it runs. This step is only for people who like
+things set up ahead of time.
 
 ```bash
 wrangler d1 execute lab-comments --remote --file=./schema.sql
 ```
 
-(Tidy path, not a hard step: the Worker also makes the table on its
-own the first time it runs.)
-
 **3. Connect the database to your site.**
 
 Copy `wrangler.toml.example` to `wrangler.toml`, put in your project
-name, and paste the `database_id` from step 1. The binding name must
+name, and paste the `database_id` from step 1. Your project name is
+the name listed for your site in your Cloudflare Pages dashboard —
+it can be different from your website's name. The binding name must
 be `DB` — that is the name the Worker looks for.
 
 No `wrangler.toml`? Do it in the Cloudflare dashboard instead: your
@@ -125,16 +160,21 @@ All settings sit at the top of the comments part of `worker.js`.
 
 | Setting | Default | What it does |
 |---|---|---|
-| `COMMENT_NAME_MAX` | 40 | Longest name we accept (letters) |
-| `COMMENT_BODY_MAX` | 1000 | Longest comment we accept (letters) |
+| `COMMENT_NAME_MAX` | 40 | Longest name we accept (characters) |
+| `COMMENT_BODY_MAX` | 1000 | Longest comment we accept (characters) |
 | `COMMENT_BODY_BYTES_MAX` | 8192 | Biggest post we accept (8 KB) |
 | `COMMENT_RATE_MAX` | 5 | Posts per hour, per person |
-| `COMMENT_HOLD_WORDS` | a short list | Words that send a comment to the human-OK queue |
+| `COMMENT_PATH_BURST_MAX` | 20 | Most comments one page can receive in 10 minutes, from everyone combined — a flood brake that works even if a spammer keeps changing addresses |
+| `COMMENT_HOLD_WORDS` | `viagra`, `cialis`, `casino`, `porn`, `escort`, `crypto giveaway`, `make money fast`, `free money`, `work from home scam` | Words that send a comment to the human-OK queue |
 | `COMMENT_LINK_RE` | built in | The pattern that spots a link in a comment |
 
 ## Checking and OK-ing held comments
 
-Held comments have the status `pending`. See them:
+Held comments have the status `pending`. How often should you
+check? Once a day is fine — held comments simply wait, and nothing
+goes live until you OK it. And the first command below only *looks*
+at the held comments. It changes nothing and cannot break anything.
+See them:
 
 ```bash
 wrangler d1 execute lab-comments --remote \
