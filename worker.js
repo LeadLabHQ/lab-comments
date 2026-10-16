@@ -15,6 +15,11 @@
 // - A hidden trap field catches simple spam bots.
 // - Each person can post 5 comments an hour. We count by a scrambled
 //   (SHA-256 hashed) address — the real address is never stored.
+// - Too-long names/comments are refused with a clear error, never
+//   silently cut off — nobody's words get quietly changed.
+// - A page can take at most 20 comments in 10 minutes from everyone
+//   combined. Real pages never move that fast; a spam flood hits this
+//   wall even if it keeps changing addresses.
 // - Every database call uses prepared statements. No string-built SQL.
 // - Comment links are shown with rel="nofollow ugc noopener noreferrer",
 //   so spam links earn nothing.
@@ -76,6 +81,8 @@ const COMMENT_NAME_MAX = 40; // longest name we accept
 const COMMENT_BODY_MAX = 1000; // longest comment we accept
 const COMMENT_BODY_BYTES_MAX = 8192; // biggest request body: 8 KB
 const COMMENT_RATE_MAX = 5; // posts per hour per person
+const COMMENT_PATH_BURST_MAX = 20; // comments per page per 10 minutes, everyone combined
+const COMMENT_PATH_BURST_MINUTES = 10; // the burst window, in minutes
 
 // A comment that looks like it holds a link waits for a human OK.
 const COMMENT_LINK_RE = /(https?:\/\/|www\.|\b[a-z0-9-]+\.(com|net|org|io|co|xyz|info|biz|ru|top|click|link)\b)/i;
@@ -101,6 +108,9 @@ async function ensureCommentsTable(env) {
   ).run();
   await env.DB.prepare(
     "CREATE INDEX IF NOT EXISTS idx_lab_comments_ip ON lab_comments (ip_hash, created_at)"
+  ).run();
+  await env.DB.prepare(
+    "CREATE INDEX IF NOT EXISTS idx_lab_comments_path_time ON lab_comments (path, created_at)"
   ).run();
 }
 
@@ -208,10 +218,18 @@ async function handleCommentsPost(request, env) {
     if (cleanString(body.website)) return json({ ok: true, status: "approved" });
 
     const path = normalizeCommentPath(body.path || "");
-    const name = truncate(cleanCommentText(body.name, false), COMMENT_NAME_MAX);
-    const text = truncate(cleanCommentText(body.body, true), COMMENT_BODY_MAX);
+    const name = cleanCommentText(body.name, false);
+    const text = cleanCommentText(body.body, true);
     if (!path || path === "/" || !name || !text) {
       return json({ ok: false, error: "invalid" }, 400);
+    }
+    // Too long? Refuse it with a clear error. We never cut a comment
+    // down quietly — the writer deserves to know.
+    if (name.length > COMMENT_NAME_MAX) {
+      return json({ ok: false, error: "name_too_long" }, 400);
+    }
+    if (text.length > COMMENT_BODY_MAX) {
+      return json({ ok: false, error: "too_long" }, 400);
     }
 
     await ensureCommentsTable(env);
@@ -226,6 +244,18 @@ async function handleCommentsPost(request, env) {
       return json({ ok: false, error: "rate_limited" }, 429);
     }
 
+    // Flood brake for the whole page: counts every accepted comment on
+    // this page in the last few minutes (shown and held alike), from
+    // all addresses together — changing addresses cannot dodge it.
+    const pathRecent = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM lab_comments WHERE path = ? AND created_at >= datetime('now', ?)"
+    )
+      .bind(path, "-" + COMMENT_PATH_BURST_MINUTES + " minutes")
+      .first();
+    if (pathRecent && typeof pathRecent.n === "number" && pathRecent.n >= COMMENT_PATH_BURST_MAX) {
+      return json({ ok: false, error: "rate_limited" }, 429);
+    }
+
     const lower = text.toLowerCase();
     const held =
       COMMENT_LINK_RE.test(text) ||
@@ -235,7 +265,9 @@ async function handleCommentsPost(request, env) {
     await env.DB.prepare(
       "INSERT INTO lab_comments (path, name, body, ip_hash, status) VALUES (?, ?, ?, ?, ?)"
     )
-      .bind(path, name, text, ipHash, status)
+      // The truncate() calls are a safety net only — the length checks
+      // above refuse anything too long first, so they never cut text.
+      .bind(path, truncate(name, COMMENT_NAME_MAX), truncate(text, COMMENT_BODY_MAX), ipHash, status)
       .run();
 
     return json({ ok: true, status });

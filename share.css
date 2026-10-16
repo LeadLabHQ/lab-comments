@@ -8,7 +8,8 @@
 .lab-share-label{font-size:13px;letter-spacing:1.6px;text-transform:uppercase;font-weight:bold;color:var(--ls-green);margin:0 0 10px}
 .lab-share-btns{display:flex;flex-wrap:wrap;gap:8px}
 .lab-share-btns a,.lab-share-btns button{
-  display:inline-block;font:inherit;font-size:14px;line-height:1.2;cursor:pointer;
+  display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;min-height:44px;
+  font:inherit;font-size:14px;line-height:1.2;cursor:pointer;
   padding:8px 13px;border-radius:999px;border:1px solid var(--ls-green);
   color:var(--ls-green-dark);background:var(--ls-card);text-decoration:none;
 }
