@@ -5,7 +5,8 @@
 
 name = "your-site-name"
 compatibility_date = "2024-11-01"
-pages_build_output_dir = "./public"
+# Your site files live in the project root, next to _worker.js,
+# so this file needs no build-output folder setting.
 
 # The comments database. Create it first:
 #   wrangler d1 create lab-comments
