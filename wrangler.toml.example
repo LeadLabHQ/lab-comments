@@ -1,0 +1,17 @@
+# Copy this file to wrangler.toml and fill in your own values.
+# This is the setup for a Cloudflare Pages project in "advanced mode":
+# the _worker.js file in the project root runs first, and your static
+# files are served through it.
+
+name = "your-site-name"
+compatibility_date = "2024-11-01"
+pages_build_output_dir = "./public"
+
+# The comments database. Create it first:
+#   wrangler d1 create lab-comments
+# Then paste the database_id wrangler gives you below.
+# The binding name MUST be "DB" — the worker looks for env.DB.
+[[d1_databases]]
+binding = "DB"
+database_name = "lab-comments"
+database_id = "00000000-0000-0000-0000-000000000000"

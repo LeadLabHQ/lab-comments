@@ -1,0 +1,32 @@
+/* Lab Comments — widget styles. Plain CSS, no external assets.
+   Change the colors at the top to match your site. */
+.lab-comments{
+  --lc-green:#015224; --lc-green-dark:#003d1a; --lc-gold:#FEC046;
+  --lc-ink:#14211a; --lc-muted:#5a6a60; --lc-card:#ffffff; --lc-line:#e3e0d4;
+  margin:40px 0 8px; padding:22px 0 4px; border-top:2px solid var(--lc-line);
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:var(--lc-ink);
+}
+.lab-comments-title{font-family:Georgia,"Times New Roman",serif;font-size:26px;color:var(--lc-green-dark);margin:0 0 6px}
+.lab-comments-note{font-size:14px;color:var(--lc-muted);margin:0 0 16px}
+.lab-comment{border:1px solid var(--lc-line);background:var(--lc-card);border-radius:10px;padding:12px 14px;margin:0 0 10px}
+.lab-comment-head{font-size:13px;color:var(--lc-muted);margin:0 0 4px}
+.lab-comment-head strong{color:var(--lc-ink);font-size:14px}
+.lab-comment-body{font-size:16px;line-height:1.55;margin:0;white-space:pre-wrap;word-wrap:break-word}
+.lab-comment-body a{color:var(--lc-green);text-decoration:underline}
+.lab-comments-empty{font-size:15px;color:var(--lc-muted)}
+.lab-comment-form{margin-top:18px;border:1px solid var(--lc-line);background:var(--lc-card);border-radius:10px;padding:16px}
+.lab-comment-form label{display:block;font-size:13px;font-weight:bold;letter-spacing:.4px;color:var(--lc-green-dark);margin:0 0 6px}
+.lab-comment-form input[type="text"],.lab-comment-form textarea{
+  width:100%;box-sizing:border-box;font:inherit;font-size:16px;color:var(--lc-ink);
+  border:1px solid var(--lc-line);border-radius:8px;padding:9px 11px;margin:0 0 14px;background:#fff;
+}
+.lab-comment-form textarea{min-height:96px;resize:vertical}
+.lab-comment-form button[type="submit"]{
+  font:inherit;font-size:15px;font-weight:bold;cursor:pointer;border:none;border-radius:999px;
+  background:var(--lc-green);color:#fff;padding:10px 20px;
+}
+.lab-comment-form button[type="submit"]:hover{background:var(--lc-green-dark)}
+.lab-comment-form button[type="submit"]:disabled{opacity:.55;cursor:wait}
+.lab-form-status{font-size:14px;color:var(--lc-muted);margin:10px 0 0}
+.lab-hp{position:absolute!important;left:-9999px!important;width:1px;height:1px;opacity:0;overflow:hidden}

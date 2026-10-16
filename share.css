@@ -1,0 +1,16 @@
+/* OPTIONAL BONUS — Lab Share Bar styles. Plain CSS, no external assets. */
+.lab-share{
+  --ls-green:#015224; --ls-green-dark:#003d1a; --ls-gold:#FEC046;
+  --ls-ink:#14211a; --ls-muted:#5a6a60; --ls-card:#ffffff; --ls-line:#e3e0d4;
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:var(--ls-ink);
+}
+.lab-share-label{font-size:13px;letter-spacing:1.6px;text-transform:uppercase;font-weight:bold;color:var(--ls-green);margin:0 0 10px}
+.lab-share-btns{display:flex;flex-wrap:wrap;gap:8px}
+.lab-share-btns a,.lab-share-btns button{
+  display:inline-block;font:inherit;font-size:14px;line-height:1.2;cursor:pointer;
+  padding:8px 13px;border-radius:999px;border:1px solid var(--ls-green);
+  color:var(--ls-green-dark);background:var(--ls-card);text-decoration:none;
+}
+.lab-share-btns a:hover,.lab-share-btns button:hover{background:var(--ls-gold);border-color:var(--ls-gold);color:var(--ls-ink)}
+.lab-share-note{font-size:14px;color:var(--ls-muted);margin:10px 0 0}
