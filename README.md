@@ -29,8 +29,12 @@ them around the web. This one does the opposite:
   shown on the page as text only — never as HTML. A comment can say
   anything, but it can never *do* anything.
 - **Link comments wait for a human.** If a comment has a link in it
-  (or a known spam word), it is held back. It only shows after you
-  OK it. You are the spam filter, and spam never reaches your page.
+  (or a known spam word) — **in the text or in the name on it** — it
+  is held back. It only shows after you OK it. You are the spam
+  filter, and spam never reaches your page.
+- **Double-posts collapse.** The same comment sent twice within 10
+  minutes (a double-click, a retried phone post) is answered with the
+  first copy's status. It is never posted twice.
 - **Spam links earn nothing.** Links in comments are marked
   `nofollow ugc`, so they pass no search-engine value. Spammers gain
   nothing by posting them.
@@ -139,11 +143,60 @@ Put your Pages project online the way you always do. Open a page and
 post a test comment. A plain comment shows right away. A comment with
 a link in it waits for your OK — that is the system working.
 
+**One box per page.** The widget builds itself into the first
+`<div id="lab-comments">` it finds. A page carries **one** comment
+box — a second box on the same page will not build. If you want
+comments in two places, they belong on two pages (each page's box
+keeps its own comment list, or pin a box to a chosen list with
+`data-path`).
+
+## Try it locally first (no deploy needed)
+
+You can run the whole thing on your own computer before anything
+goes online. This is the path we test with ourselves:
+
+1. Put your site's files in a folder, with `worker.js` copied in as
+   `_worker.js` and a `wrangler.toml` (from step 3 above) naming the
+   `DB` binding.
+2. Make the table in the **local** database:
+
+   ```bash
+   wrangler d1 execute lab-comments --local --file=./schema.sql
+   ```
+
+   (You can skip this too — the Worker creates the table on first
+   use, locally just like online.)
+3. Start the local site:
+
+   ```bash
+   wrangler pages dev
+   ```
+
+4. Open the local address Wrangler prints (usually
+   `http://localhost:8788`), go to a page with the comment box, and
+   post. Local comments live in the local database only — nothing
+   touches your real site or its real comments. When you're done,
+   deploy the same files (step 6) and it behaves identically online.
+
+## Run the tests
+
+The repo carries a plain-Node test file (no packages to install)
+that exercises the Worker end to end — holds, duplicates, the
+homepage path, the flood brake, the lot:
+
+```bash
+node tests/comments.test.mjs
+```
+
+Point it at another copy of the worker to test that copy instead:
+`node tests/comments.test.mjs /path/to/_worker.js`.
+
 ## What's in this repo
 
 | File | What it does | Must you edit it? |
 |---|---|---|
 | `worker.js` | The Worker: takes in comments, serves them back, holds link comments | Only the settings at the top, if you want |
+| `tests/` | Plain-Node regression tests for the Worker | No |
 | `schema.sql` | Makes the comments table in the database | No |
 | `comments.js` | Builds the comment box on your page | No |
 | `comments.css` | How the comment box looks | Only if you want your own style |
@@ -165,6 +218,7 @@ All settings sit at the top of the comments part of `worker.js`.
 | `COMMENT_BODY_BYTES_MAX` | 8192 | Biggest post we accept (8 KB) |
 | `COMMENT_RATE_MAX` | 5 | Posts per hour, per person |
 | `COMMENT_PATH_BURST_MAX` | 20 | Most comments one page can receive in 10 minutes, from everyone combined — a flood brake that works even if a spammer keeps changing addresses |
+| `COMMENT_DEDUPE_MINUTES` | 10 | Window in which the exact same comment (same page, name, and text) counts as a double-post and is answered instead of re-posted |
 | `COMMENT_HOLD_WORDS` | `viagra`, `cialis`, `casino`, `porn`, `escort`, `crypto giveaway`, `make money fast`, `free money`, `work from home scam` | Words that send a comment to the human-OK queue |
 | `COMMENT_LINK_RE` | built in | The pattern that spots a link in a comment |
 
@@ -208,12 +262,28 @@ wrangler d1 execute lab-comments --remote \
   or `connect-src` in `worker.js` — widen one thing at a time and test.
 - The page never inserts comment HTML. Keep it that way if you edit
   `comments.js`: text nodes only.
+- **Change the salt.** The scrambled addresses are hashed with the
+  prefix `"lab-comments:"` (see `hashIp` in `worker.js`). Change it
+  to a phrase of your own when you install. Then your site's
+  scrambled addresses can never be matched against another site
+  running this same code, and nobody can pre-compute the scramble
+  for a known address. Changing it later is safe — it only resets
+  who counts as "the same person" for the hourly limit.
 
 ## Honest limits
 
-- **It is for small sites.** One list per page, newest last, up to 200
-  shown per page. No threads, no replies, no likes, no avatars, no
-  sign-in choices, no email alerts.
+- **It is for small sites.** One list per page, in posting order. **At
+  most 200 approved comments are shown per page** — anything past
+  200 stays safe in the database but is not displayed. No threads,
+  no replies, no likes, no avatars, no sign-in choices, no email
+  alerts.
+- **The link check is plain on purpose.** It holds anything that
+  *looks* like a web address — including a bare domain typed without
+  `https://` (like `example.com` on its own) and anything shaped like
+  an email address (like `me@example.com`), because to a pattern
+  they look the same as a link. A perfectly good comment that names
+  a site that way waits for the same human OK. Held, never deleted —
+  but you should know it happens, because your readers will meet it.
 - **A human does the link OKs.** That is the price of "no spam links,
   ever." On a busy site the queue would grow teeth.
 - **It is not a Disqus replacement at scale.** If you get hundreds of

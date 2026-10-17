@@ -118,6 +118,31 @@
     return p;
   }
 
+  // Times are stored as UTC "YYYY-MM-DD HH:MM:SS". Readers see human
+  // relative text ("3 hours ago"); the <time datetime> element keeps
+  // the exact moment for machines and screen readers.
+  var MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  function timeNode(createdAt) {
+    var iso = String(createdAt || "").replace(" ", "T");
+    if (iso && iso.indexOf("Z") === -1 && iso.indexOf("+") === -1) iso += "Z";
+    var t = document.createElement("time");
+    t.setAttribute("datetime", iso);
+    var then = Date.parse(iso);
+    var text;
+    if (isNaN(then)) {
+      text = String(createdAt || "");
+    } else {
+      var secs = Math.max(0, Math.floor((Date.now() - then) / 1000));
+      if (secs < 60) text = "just now";
+      else if (secs < 3600) { var m = Math.floor(secs / 60); text = m + (m === 1 ? " minute ago" : " minutes ago"); }
+      else if (secs < 86400) { var h = Math.floor(secs / 3600); text = h + (h === 1 ? " hour ago" : " hours ago"); }
+      else if (secs < 86400 * 30) { var d = Math.floor(secs / 86400); text = d + (d === 1 ? " day ago" : " days ago"); }
+      else { var dt = new Date(then); text = MONTHS[dt.getMonth()] + " " + dt.getDate() + ", " + dt.getFullYear(); }
+    }
+    t.textContent = text;
+    return t;
+  }
+
   function render(comments) {
     list.textContent = "";
     count.textContent = comments.length ? "(" + comments.length + ")" : "";
@@ -129,7 +154,8 @@
       var box = el("div", "lab-comment");
       var head = el("p", "lab-comment-head");
       head.appendChild(el("strong", "", c.name));
-      head.appendChild(document.createTextNode(" · " + c.created_at));
+      head.appendChild(document.createTextNode(" · "));
+      head.appendChild(timeNode(c.created_at));
       box.appendChild(head);
       box.appendChild(bodyNode(c.body));
       list.appendChild(box);
@@ -164,15 +190,32 @@
       .then(function (r) { return r.json().then(function (d) { return { status: r.status, data: d }; }); })
       .then(function (res) {
         submit.disabled = false;
-        if (res.data && res.data.ok && res.data.status === "approved") {
+        if (res.data && res.data.ok && res.data.duplicate) {
+          status.textContent = res.data.status === "pending"
+            ? "That comment is already with a person to read — no need to send it twice."
+            : "That comment is already posted — no need to send it twice.";
+          bodyInput.value = "";
+        } else if (res.data && res.data.ok && res.data.status === "approved") {
           status.textContent = "Posted — thank you.";
           bodyInput.value = "";
           load();
         } else if (res.data && res.data.ok && res.data.status === "pending") {
-          status.textContent = "Thanks — your comment includes a link, so a person reads it before it appears here.";
+          if (res.data.held === "name_link") {
+            status.textContent = "Thanks — your name includes a link, so a person reads your comment before it appears here.";
+          } else if (res.data.held === "word") {
+            status.textContent = "Thanks — a person reads your comment before it appears here.";
+          } else {
+            status.textContent = "Thanks — your comment includes a link, so a person reads it before it appears here.";
+          }
           bodyInput.value = "";
+        } else if (res.data && res.data.error === "too_long") {
+          status.textContent = "That comment is too long — please trim it a little.";
+        } else if (res.data && res.data.error === "name_too_long") {
+          status.textContent = "That name is too long — please shorten it a little.";
+        } else if (res.data && res.data.error === "path_busy") {
+          status.textContent = "This page is getting a lot of comments right now — try again in a few minutes.";
         } else if (res.status === 429) {
-          status.textContent = "You are posting fast — please wait a bit and try again.";
+          status.textContent = "You have posted a few comments in the last hour — the limit is five an hour. Please wait a bit and try again.";
         } else {
           status.textContent = "That did not post. Please check the comment and try again.";
         }

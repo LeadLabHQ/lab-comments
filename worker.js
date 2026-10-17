@@ -11,7 +11,16 @@
 // - No accounts for readers. No cookies. No tracking. No ads.
 // - Comments are stored as plain text. The web page shows them with
 //   text-only rendering, so comment text can never turn into code.
-// - Any comment with a link in it waits for a human OK before it shows.
+// - Any comment with a link in it — in the text OR in the name — waits
+//   for a human OK before it shows. Names are screened for spam words
+//   too. The reply names the hold reason so the reader hears the truth.
+// - The same comment sent twice (same page + name + text, within 10
+//   minutes) is answered with the first copy's status, never posted
+//   twice — double-clicks and retries are safe.
+// - A page flooded with comments answers new posters with a message
+//   that blames the busy page, never the reader.
+// - The homepage path "/" is a valid comment path (an earlier version
+//   refused it, which broke commenting from a site's front page).
 // - A hidden trap field catches simple spam bots.
 // - Each person can post 5 comments an hour. We count by a scrambled
 //   (SHA-256 hashed) address — the real address is never stored.
@@ -83,6 +92,7 @@ const COMMENT_BODY_BYTES_MAX = 8192; // biggest request body: 8 KB
 const COMMENT_RATE_MAX = 5; // posts per hour per person
 const COMMENT_PATH_BURST_MAX = 20; // comments per page per 10 minutes, everyone combined
 const COMMENT_PATH_BURST_MINUTES = 10; // the burst window, in minutes
+const COMMENT_DEDUPE_MINUTES = 10; // exact-duplicate window (same page + name + text)
 
 // A comment that looks like it holds a link waits for a human OK.
 const COMMENT_LINK_RE = /(https?:\/\/|www\.|\b[a-z0-9-]+\.(com|net|org|io|co|xyz|info|biz|ru|top|click|link)\b)/i;
@@ -124,6 +134,7 @@ function normalizeCommentPath(raw) {
     return null;
   }
   p = p.split(/[?#]/)[0].trim();
+  if (p === "") return "/"; // an empty path can only mean the homepage
   if (!p.startsWith("/") || p.startsWith("//")) return null;
   if (!/^\/[A-Za-z0-9\-._~\/]*$/.test(p)) return null;
   if (p.length > 200) return null;
@@ -146,6 +157,13 @@ async function hashIp(request) {
     request.headers.get("cf-connecting-ip") ||
     request.headers.get("x-forwarded-for") ||
     "unknown";
+  // PER-INSTALL SALT: the "lab-comments:" prefix below is the salt for
+  // the address scramble. Change it to a word or phrase of your own
+  // when you install — then your site's scrambled addresses can never
+  // be matched against anyone else's copy of this code, and nobody can
+  // pre-compute the scramble for a known address. (Changing it later
+  // is safe: it only resets who counts as "the same person" for the
+  // hourly limit.)
   const digest = await crypto.subtle.digest(
     "SHA-256",
     new TextEncoder().encode("lab-comments:" + ip)
@@ -220,7 +238,9 @@ async function handleCommentsPost(request, env) {
     const path = normalizeCommentPath(body.path || "");
     const name = cleanCommentText(body.name, false);
     const text = cleanCommentText(body.body, true);
-    if (!path || path === "/" || !name || !text) {
+    // "/" (the homepage) is a valid path — refusing it broke posting
+    // from a site's front page, whose canonical path IS "/".
+    if (!path || !name || !text) {
       return json({ ok: false, error: "invalid" }, 400);
     }
     // Too long? Refuse it with a clear error. We never cut a comment
@@ -241,25 +261,56 @@ async function handleCommentsPost(request, env) {
       .bind(ipHash)
       .first();
     if (recent && typeof recent.n === "number" && recent.n >= COMMENT_RATE_MAX) {
-      return json({ ok: false, error: "rate_limited" }, 429);
+      return json({
+        ok: false,
+        error: "rate_limited",
+        message: "You have posted a few comments in the last hour — the limit is five an hour. Please wait a bit and try again.",
+      }, 429);
     }
 
     // Flood brake for the whole page: counts every accepted comment on
     // this page in the last few minutes (shown and held alike), from
-    // all addresses together — changing addresses cannot dodge it.
+    // all addresses together — changing addresses cannot dodge it. Its
+    // error is 'path_busy', not 'rate_limited': the reader did nothing
+    // wrong, the page is simply flooded, and the message says so.
     const pathRecent = await env.DB.prepare(
       "SELECT COUNT(*) AS n FROM lab_comments WHERE path = ? AND created_at >= datetime('now', ?)"
     )
       .bind(path, "-" + COMMENT_PATH_BURST_MINUTES + " minutes")
       .first();
     if (pathRecent && typeof pathRecent.n === "number" && pathRecent.n >= COMMENT_PATH_BURST_MAX) {
-      return json({ ok: false, error: "rate_limited" }, 429);
+      return json({
+        ok: false,
+        error: "path_busy",
+        message: "This page is getting a lot of comments right now — try again in a few minutes.",
+      }, 429);
     }
 
+    // Sent twice? The exact same comment (page + name + text) inside
+    // the dedupe window is answered with the original's status —
+    // idempotent, never double-posted.
+    const dupe = await env.DB.prepare(
+      "SELECT status FROM lab_comments WHERE path = ? AND name = ? AND body = ? AND created_at >= datetime('now', ?) ORDER BY id ASC LIMIT 1"
+    )
+      .bind(path, name, text, "-" + COMMENT_DEDUPE_MINUTES + " minutes")
+      .first();
+    if (dupe && typeof dupe.status === "string") {
+      return json({ ok: true, status: dupe.status, duplicate: true });
+    }
+
+    // The name is screened like the text: a link or a spam word in
+    // either one sends the comment to a human first. The reason
+    // travels with the reply ('held') so the page can say plainly
+    // what happened.
     const lower = text.toLowerCase();
-    const held =
-      COMMENT_LINK_RE.test(text) ||
-      COMMENT_HOLD_WORDS.some((w) => lower.includes(w));
+    const nameLower = name.toLowerCase();
+    let held = null;
+    if (COMMENT_LINK_RE.test(text)) held = "link";
+    else if (COMMENT_LINK_RE.test(name)) held = "name_link";
+    else if (
+      COMMENT_HOLD_WORDS.some((w) => lower.includes(w)) ||
+      COMMENT_HOLD_WORDS.some((w) => nameLower.includes(w))
+    ) held = "word";
     const status = held ? "pending" : "approved";
 
     await env.DB.prepare(
@@ -270,7 +321,7 @@ async function handleCommentsPost(request, env) {
       .bind(path, truncate(name, COMMENT_NAME_MAX), truncate(text, COMMENT_BODY_MAX), ipHash, status)
       .run();
 
-    return json({ ok: true, status });
+    return held ? json({ ok: true, status, held }) : json({ ok: true, status });
   } catch {
     return json({ ok: false, error: "server" }, 500);
   }

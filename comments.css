@@ -25,8 +25,16 @@
 .lab-comment-form button[type="submit"]{
   font:inherit;font-size:15px;font-weight:bold;cursor:pointer;border:none;border-radius:999px;
   background:var(--lc-green);color:#fff;padding:10px 20px;
+  min-height:44px;display:inline-flex;align-items:center;justify-content:center;
 }
 .lab-comment-form button[type="submit"]:hover{background:var(--lc-green-dark)}
 .lab-comment-form button[type="submit"]:disabled{opacity:.55;cursor:wait}
 .lab-form-status{font-size:14px;color:var(--lc-muted);margin:10px 0 0}
 .lab-hp{position:absolute!important;left:-9999px!important;width:1px;height:1px;opacity:0;overflow:hidden}
+/* Keyboard focus you can actually see, and steady time figures. */
+.lab-comments a:focus-visible,.lab-comment-form button:focus-visible,
+.lab-comment-form input[type="text"]:focus-visible,
+.lab-comment-form textarea:focus-visible{
+  outline:3px solid var(--lc-green);outline-offset:2px;
+}
+.lab-comment-head time{font-variant-numeric:tabular-nums}
