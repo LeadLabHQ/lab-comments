@@ -5,6 +5,8 @@
 // What it does:
 // - GET  /api/comments?path=/your-page  -> the approved comments for a page
 // - POST /api/comments                  -> add a comment
+// - POST /api/comments/report           -> a reader flags a comment for a person
+// - GET  /api/comments/moderation       -> the token-gated moderation queue page
 // Everything else is passed through to your site's static files.
 //
 // Safety design (the short version):
@@ -93,6 +95,24 @@ const COMMENT_RATE_MAX = 5; // posts per hour per person
 const COMMENT_PATH_BURST_MAX = 20; // comments per page per 10 minutes, everyone combined
 const COMMENT_PATH_BURST_MINUTES = 10; // the burst window, in minutes
 const COMMENT_DEDUPE_MINUTES = 10; // exact-duplicate window (same page + name + text)
+const COMMENT_REPORT_RATE_MAX = 10; // reports per hour per person
+const COMMENT_REPORT_HOLD_THRESHOLD = 2; // reports that send an approved comment back to a person
+
+// Hold-first mode. When this is true, a person's very first comment
+// on your site (the first one ever from their address, in any state —
+// shown, held, or rejected) waits for a human OK before it shows,
+// with the hold reason "first". People who have commented before are
+// not affected. It is a strong setting: on a busy site it means every
+// new reader waits. It ships off — turn it on only if you want that.
+const COMMENTS_HOLD_FIRST = false;
+
+// Global velocity watch. If one person posts this many comments
+// across ALL pages (not just one page) inside the window below, the
+// next comment is held for a person instead of shown — reason
+// "velocity". It is held, never refused outright: a keen reader
+// having a busy ten minutes still gets read by a person.
+const COMMENTS_GLOBAL_VELOCITY_MAX = 10; // comments across all pages
+const COMMENTS_GLOBAL_VELOCITY_MINUTES = 10; // the velocity window, in minutes
 
 // A comment that looks like it holds a link waits for a human OK.
 const COMMENT_LINK_RE = /(https?:\/\/|www\.|\b[a-z0-9-]+\.(com|net|org|io|co|xyz|info|biz|ru|top|click|link)\b)/i;
@@ -121,6 +141,27 @@ async function ensureCommentsTable(env) {
   ).run();
   await env.DB.prepare(
     "CREATE INDEX IF NOT EXISTS idx_lab_comments_path_time ON lab_comments (path, created_at)"
+  ).run();
+  // v2: how many readers have reported this comment. Older tables do
+  // not have the column yet, so the add is guarded — if the column
+  // is already there, the database says no and we carry on.
+  try {
+    await env.DB.prepare(
+      "ALTER TABLE lab_comments ADD COLUMN report_count INTEGER NOT NULL DEFAULT 0"
+    ).run();
+  } catch {
+    // Column already exists — that is the normal case after v2 runs once.
+  }
+  // One row per report. The UNIQUE pair means the same person
+  // reporting the same comment twice is counted once.
+  await env.DB.prepare(
+    "CREATE TABLE IF NOT EXISTS lab_comment_reports (" +
+      "comment_id INTEGER NOT NULL, ip_hash TEXT, " +
+      "created_at TEXT NOT NULL DEFAULT (datetime('now')), " +
+      "UNIQUE(comment_id, ip_hash))"
+  ).run();
+  await env.DB.prepare(
+    "CREATE INDEX IF NOT EXISTS idx_lab_comment_reports_ip ON lab_comment_reports (ip_hash, created_at)"
   ).run();
 }
 
@@ -195,7 +236,7 @@ async function handleCommentsGet(request, env) {
     if (!path) return json({ ok: false, error: "invalid" }, 400);
     await ensureCommentsTable(env);
     const rows = await env.DB.prepare(
-      "SELECT name, body, created_at FROM lab_comments WHERE path = ? AND status = 'approved' ORDER BY id ASC LIMIT 200"
+      "SELECT id, name, body, created_at FROM lab_comments WHERE path = ? AND status = 'approved' ORDER BY id ASC LIMIT 200"
     )
       .bind(path)
       .all();
@@ -260,12 +301,41 @@ async function handleCommentsPost(request, env) {
     )
       .bind(ipHash)
       .first();
-    if (recent && typeof recent.n === "number" && recent.n >= COMMENT_RATE_MAX) {
+
+    // Global velocity watch: this person's comments on every page
+    // together in the last few minutes. This is checked here, right
+    // after the hourly count, because the hourly limit (5 an hour)
+    // would otherwise always answer first and the velocity hold
+    // could never be reached by a seeded or fast-moving flood. When
+    // the velocity count is over the line, the comment below is held
+    // for a person instead of refused — the hourly refusal only
+    // answers when the velocity watch has not already claimed it.
+    const velocity = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM lab_comments WHERE ip_hash = ? AND created_at >= datetime('now', ?)"
+    )
+      .bind(ipHash, "-" + COMMENTS_GLOBAL_VELOCITY_MINUTES + " minutes")
+      .first();
+    const velocityHeld =
+      velocity && typeof velocity.n === "number" && velocity.n >= COMMENTS_GLOBAL_VELOCITY_MAX;
+
+    if (!velocityHeld && recent && typeof recent.n === "number" && recent.n >= COMMENT_RATE_MAX) {
       return json({
         ok: false,
         error: "rate_limited",
         message: "You have posted a few comments in the last hour — the limit is five an hour. Please wait a bit and try again.",
       }, 429);
+    }
+
+    // Hold-first mode (off unless the setting at the top says on):
+    // has this person ever commented here before, in any state?
+    let firstEver = false;
+    if (COMMENTS_HOLD_FIRST) {
+      const prior = await env.DB.prepare(
+        "SELECT COUNT(*) AS n FROM lab_comments WHERE ip_hash = ?"
+      )
+        .bind(ipHash)
+        .first();
+      firstEver = !prior || typeof prior.n !== "number" || prior.n === 0;
     }
 
     // Flood brake for the whole page: counts every accepted comment on
@@ -311,6 +381,11 @@ async function handleCommentsPost(request, env) {
       COMMENT_HOLD_WORDS.some((w) => lower.includes(w)) ||
       COMMENT_HOLD_WORDS.some((w) => nameLower.includes(w))
     ) held = "word";
+    // Hold-first and the velocity watch hold a comment the same way;
+    // the velocity reason is named first because it says the most
+    // about what just happened.
+    if (velocityHeld) held = "velocity";
+    else if (firstEver) held = "first";
     const status = held ? "pending" : "approved";
 
     await env.DB.prepare(
@@ -325,6 +400,256 @@ async function handleCommentsPost(request, env) {
   } catch {
     return json({ ok: false, error: "server" }, 500);
   }
+}
+
+// ---------- reports (v2) ----------
+
+// A reader flags a comment. The report is counted once per person
+// (the same scrambled address reporting the same comment again is a
+// quiet "already noted"), reports are limited to 10 an hour per
+// person, and when a shown comment reaches the report threshold it
+// goes back to pending so a person reads it again.
+async function handleCommentsReport(request, env) {
+  try {
+    if (!commentOriginOk(request)) {
+      return json({ ok: false, error: "origin" }, 403);
+    }
+    const ctype = request.headers.get("content-type") || "";
+    if (!ctype.toLowerCase().startsWith("application/json")) {
+      return json({ ok: false, error: "content_type" }, 415);
+    }
+    const declared = Number(request.headers.get("content-length") || 0);
+    if (declared > COMMENT_BODY_BYTES_MAX) {
+      return json({ ok: false, error: "too_large" }, 413);
+    }
+    const raw = await request.text();
+    if (new TextEncoder().encode(raw).length > COMMENT_BODY_BYTES_MAX) {
+      return json({ ok: false, error: "too_large" }, 413);
+    }
+    let body;
+    try {
+      body = JSON.parse(raw);
+    } catch {
+      return json({ ok: false, error: "invalid" }, 400);
+    }
+    if (!body || typeof body !== "object") {
+      return json({ ok: false, error: "invalid" }, 400);
+    }
+
+    // Honeypot: a filled hidden field means a bot. Pretend success.
+    if (cleanString(body.website)) return json({ ok: true });
+
+    const id = Number(body.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      return json({ ok: false, error: "invalid" }, 400);
+    }
+
+    await ensureCommentsTable(env);
+
+    const comment = await env.DB.prepare(
+      "SELECT id, status, report_count FROM lab_comments WHERE id = ?"
+    )
+      .bind(id)
+      .first();
+    if (!comment) {
+      return json({ ok: false, error: "not_found" }, 404);
+    }
+
+    const ipHash = await hashIp(request);
+
+    // Already reported by this person? Counted once, answered plainly.
+    const existing = await env.DB.prepare(
+      "SELECT comment_id FROM lab_comment_reports WHERE comment_id = ? AND ip_hash = ?"
+    )
+      .bind(id, ipHash)
+      .first();
+    if (existing) return json({ ok: true, duplicate: true });
+
+    const reportRecent = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM lab_comment_reports WHERE ip_hash = ? AND created_at >= datetime('now', '-1 hour')"
+    )
+      .bind(ipHash)
+      .first();
+    if (reportRecent && typeof reportRecent.n === "number" && reportRecent.n >= COMMENT_REPORT_RATE_MAX) {
+      return json({
+        ok: false,
+        error: "rate_limited",
+        message: "You have reported a few comments in the last hour — the limit is ten an hour. Thank you for flagging them; please wait a bit before reporting more.",
+      }, 429);
+    }
+
+    await env.DB.prepare(
+      "INSERT INTO lab_comment_reports (comment_id, ip_hash) VALUES (?, ?)"
+    )
+      .bind(id, ipHash)
+      .run();
+
+    await env.DB.prepare(
+      "UPDATE lab_comments SET report_count = report_count + 1 WHERE id = ?"
+    )
+      .bind(id)
+      .run();
+
+    const newCount = (typeof comment.report_count === "number" ? comment.report_count : 0) + 1;
+    if (newCount >= COMMENT_REPORT_HOLD_THRESHOLD && comment.status === "approved") {
+      await env.DB.prepare(
+        "UPDATE lab_comments SET status = 'pending' WHERE id = ?"
+      )
+        .bind(id)
+        .run();
+    }
+
+    return json({ ok: true });
+  } catch {
+    return json({ ok: false, error: "server" }, 500);
+  }
+}
+
+// ---------- moderation queue (v2) ----------
+
+// The queue is gated by a secret token the site owner sets as the
+// COMMENTS_MOD_TOKEN environment variable (a Pages secret — never in
+// this file). If it is not set, the queue is off and every route
+// below answers 403. The token travels in the x-mod-token header,
+// or as ?token= on the queue page itself so the page can be opened
+// from a bookmark.
+function modTokenOk(request, env) {
+  const expected = env && typeof env.COMMENTS_MOD_TOKEN === "string"
+    ? env.COMMENTS_MOD_TOKEN : "";
+  if (!expected) return false;
+  const url = new URL(request.url);
+  const given = request.headers.get("x-mod-token") || url.searchParams.get("token") || "";
+  return given !== "" && given === expected;
+}
+
+async function handleModerationList(request, env) {
+  if (!modTokenOk(request, env)) {
+    return json({ ok: false, error: "forbidden" }, 403);
+  }
+  try {
+    await ensureCommentsTable(env);
+    const rows = await env.DB.prepare(
+      "SELECT id, path, name, body, created_at, report_count FROM lab_comments WHERE status = 'pending' ORDER BY id ASC LIMIT 200"
+    ).all();
+    const pending = rows.results || [];
+    return json({ ok: true, pending, count: pending.length });
+  } catch {
+    return json({ ok: false, error: "server" }, 500);
+  }
+}
+
+async function handleModerationAct(request, env) {
+  if (!modTokenOk(request, env)) {
+    return json({ ok: false, error: "forbidden" }, 403);
+  }
+  try {
+    const ctype = request.headers.get("content-type") || "";
+    if (!ctype.toLowerCase().startsWith("application/json")) {
+      return json({ ok: false, error: "content_type" }, 415);
+    }
+    let body;
+    try {
+      body = JSON.parse(await request.text());
+    } catch {
+      return json({ ok: false, error: "invalid" }, 400);
+    }
+    if (!body || typeof body !== "object") {
+      return json({ ok: false, error: "invalid" }, 400);
+    }
+    const id = Number(body.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      return json({ ok: false, error: "invalid" }, 400);
+    }
+    if (body.action !== "approve" && body.action !== "reject") {
+      return json({ ok: false, error: "invalid" }, 400);
+    }
+    const status = body.action === "approve" ? "approved" : "rejected";
+    await ensureCommentsTable(env);
+    const comment = await env.DB.prepare(
+      "SELECT id, status, report_count FROM lab_comments WHERE id = ?"
+    )
+      .bind(id)
+      .first();
+    if (!comment) {
+      return json({ ok: false, error: "not_found" }, 404);
+    }
+    await env.DB.prepare(
+      "UPDATE lab_comments SET status = ? WHERE id = ?"
+    )
+      .bind(status, id)
+      .run();
+    return json({ ok: true, status });
+  } catch {
+    return json({ ok: false, error: "server" }, 500);
+  }
+}
+
+// The queue page: one small self-contained page. It holds no comment
+// text of its own — its script asks the list endpoint (with the token
+// from this page's own address) and draws each comment as text only.
+function handleModerationPage(request, env) {
+  if (!modTokenOk(request, env)) {
+    return new Response("Forbidden", {
+      status: 403,
+      headers: { "content-type": "text/plain; charset=utf-8" },
+    });
+  }
+  const html = [
+    "<!doctype html>",
+    '<html lang="en"><head><meta charset="utf-8">',
+    '<meta name="viewport" content="width=device-width, initial-scale=1">',
+    "<title>Comment moderation</title>",
+    "<style>",
+    "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#14211a;max-width:720px;margin:24px auto;padding:0 16px}",
+    "h1{font-family:Georgia,'Times New Roman',serif;color:#003d1a;font-size:26px}",
+    ".item{border:1px solid #e3e0d4;border-radius:10px;padding:12px 14px;margin:0 0 10px}",
+    ".meta{font-size:13px;color:#5a6a60;margin:0 0 4px}",
+    ".body{font-size:16px;line-height:1.55;margin:0;white-space:pre-wrap;word-wrap:break-word}",
+    "button{font:inherit;font-size:14px;font-weight:bold;cursor:pointer;border:none;border-radius:999px;padding:8px 16px;margin:10px 8px 0 0;min-height:40px}",
+    ".approve{background:#015224;color:#fff}.reject{background:#e3e0d4;color:#14211a}",
+    "button:disabled{opacity:.55;cursor:wait}",
+    "</style></head><body>",
+    "<h1>Comments waiting for a person</h1>",
+    '<p id="count">Loading…</p>',
+    '<div id="list"></div>',
+    "<script>",
+    "var token = new URLSearchParams(window.location.search).get('token') || '';",
+    "function el(tag, cls, text) { var n = document.createElement(tag); if (cls) n.className = cls; if (text !== undefined) n.textContent = text; return n; }",
+    "function act(id, action, btn) {",
+    "  btn.disabled = true;",
+    "  fetch('/api/comments/moderation/act', { method: 'POST', headers: { 'content-type': 'application/json', 'x-mod-token': token }, body: JSON.stringify({ id: id, action: action }) })",
+    "    .then(function () { load(); }).catch(function () { btn.disabled = false; });",
+    "}",
+    "function load() {",
+    "  fetch('/api/comments/moderation/list', { headers: { 'x-mod-token': token, 'accept': 'application/json' } })",
+    "    .then(function (r) { return r.json(); })",
+    "    .then(function (data) {",
+    "      var list = document.getElementById('list'); list.textContent = '';",
+    "      var pending = (data && data.pending) || [];",
+    "      document.getElementById('count').textContent = pending.length === 1 ? '1 comment waiting' : pending.length + ' comments waiting';",
+    "      if (!pending.length) { list.appendChild(el('p', '', 'Nothing waiting. All caught up.')); return; }",
+    "      pending.forEach(function (c) {",
+    "        var box = el('div', 'item');",
+    "        var meta = c.path + ' · ' + c.name + ' · ' + c.created_at + (c.report_count ? ' · reported ' + c.report_count + (c.report_count === 1 ? ' time' : ' times') : '');",
+    "        box.appendChild(el('p', 'meta', meta));",
+    "        box.appendChild(el('p', 'body', c.body));",
+    "        var ok = el('button', 'approve', 'Approve'); ok.type = 'button';",
+    "        ok.addEventListener('click', function () { act(c.id, 'approve', ok); });",
+    "        var no = el('button', 'reject', 'Reject'); no.type = 'button';",
+    "        no.addEventListener('click', function () { act(c.id, 'reject', no); });",
+    "        box.appendChild(ok); box.appendChild(no);",
+    "        list.appendChild(box);",
+    "      });",
+    "    })",
+    "    .catch(function () { document.getElementById('count').textContent = 'The queue could not load just now — please refresh.'; });",
+    "}",
+    "load();",
+    "</script></body></html>",
+  ].join("\n");
+  return new Response(html, {
+    status: 200,
+    headers: { "content-type": "text/html; charset=utf-8" },
+  });
 }
 
 // ---------- entry point ----------
@@ -349,6 +674,26 @@ async function route(request, env) {
   if (path === "/api/comments") {
     if (request.method === "GET") return handleCommentsGet(request, env);
     if (request.method === "POST") return handleCommentsPost(request, env);
+    return json({ ok: false, error: "method" }, 405);
+  }
+
+  if (path === "/api/comments/report") {
+    if (request.method === "POST") return handleCommentsReport(request, env);
+    return json({ ok: false, error: "method" }, 405);
+  }
+
+  if (path === "/api/comments/moderation") {
+    if (request.method === "GET") return handleModerationPage(request, env);
+    return json({ ok: false, error: "method" }, 405);
+  }
+
+  if (path === "/api/comments/moderation/list") {
+    if (request.method === "GET") return handleModerationList(request, env);
+    return json({ ok: false, error: "method" }, 405);
+  }
+
+  if (path === "/api/comments/moderation/act") {
+    if (request.method === "POST") return handleModerationAct(request, env);
     return json({ ok: false, error: "method" }, 405);
   }
 

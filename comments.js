@@ -63,6 +63,13 @@
   bodyInput.maxLength = 1000;
   bodyInput.required = true;
 
+  // Character hint by the comment box, added from here so the page
+  // markup needs no change: the limit, plus a live count as you type.
+  var bodyHint = el("p", "lab-comment-count", "Up to 1,000 characters · 0 / 1,000");
+  bodyInput.addEventListener("input", function () {
+    bodyHint.textContent = "Up to 1,000 characters · " + bodyInput.value.length + " / 1,000";
+  });
+
   // Honeypot: a field real people never see or fill. Bots fill it,
   // and the worker quietly drops those posts.
   var hp = el("span", "lab-hp");
@@ -85,6 +92,7 @@
   form.appendChild(nameInput);
   form.appendChild(bodyLabel);
   form.appendChild(bodyInput);
+  form.appendChild(bodyHint);
   form.appendChild(hp);
   form.appendChild(submit);
   form.appendChild(status);
@@ -158,6 +166,37 @@
       head.appendChild(timeNode(c.created_at));
       box.appendChild(head);
       box.appendChild(bodyNode(c.body));
+      // A small Report button under each comment. One click flags the
+      // comment for a person; the button then says so, in plain words.
+      if (c.id !== undefined && c.id !== null) {
+        var reportWrap = el("p", "lab-comment-report-wrap");
+        var reportBtn = el("button", "lab-comment-report", "Report");
+        reportBtn.type = "button";
+        reportBtn.addEventListener("click", function () {
+          reportBtn.disabled = true;
+          fetch("/api/comments/report", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ id: c.id })
+          })
+            .then(function (r) {
+              return r.json().then(function (d) { return { status: r.status, data: d }; })
+                .catch(function () { return { status: r.status, data: null }; });
+            })
+            .then(function (res) {
+              var note = res.status === 429
+                ? "Thanks — reports are noted."
+                : "Thanks — a person will look at it.";
+              reportWrap.textContent = "";
+              reportWrap.appendChild(el("span", "lab-comment-report-note", note));
+            })
+            .catch(function () {
+              reportBtn.disabled = false;
+            });
+        });
+        reportWrap.appendChild(reportBtn);
+        box.appendChild(reportWrap);
+      }
       list.appendChild(box);
     });
   }
@@ -202,6 +241,10 @@
         } else if (res.data && res.data.ok && res.data.status === "pending") {
           if (res.data.held === "name_link") {
             status.textContent = "Thanks — your name includes a link, so a person reads your comment before it appears here.";
+          } else if (res.data.held === "first") {
+            status.textContent = "Thanks — first comments here get a quick read by a person before they appear.";
+          } else if (res.data.held === "velocity") {
+            status.textContent = "Thanks — a person will read this one first.";
           } else if (res.data.held === "word") {
             status.textContent = "Thanks — a person reads your comment before it appears here.";
           } else {

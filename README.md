@@ -43,6 +43,16 @@ them around the web. This one does the opposite:
 - **A speed limit.** Each person can post 5 comments an hour. The
   limit counts a scrambled (SHA-256 hashed) address — real addresses
   are never stored.
+- **Readers can flag a comment.** Every comment carries a small
+  **Report** button. A report is counted once per reader, and when
+  two readers report a comment that is showing, it goes back to
+  waiting for a human OK. See "Reporting a comment" below.
+- **A flood brake across pages.** If one person posts 10 comments
+  across *all* pages in 10 minutes, the next one waits for a human
+  OK instead of showing. See "The global velocity watch" below.
+- **A token-gated queue for the OKs.** Held comments can be approved
+  or rejected from one small web page, instead of database commands.
+  See "The moderation queue" below.
 
 ## Quick start
 
@@ -50,7 +60,7 @@ You need a free [Cloudflare](https://www.cloudflare.com) account, your
 site on Cloudflare Pages, and Wrangler — Cloudflare's free
 command-line tool. About 10 minutes, in this order:
 
-**0. Before you start.**
+### 0. Before you start
 
 - **Get the files.** On this repo's GitHub page, click the green
   **Code** button, then **Download ZIP**. Unzip it, and open that
@@ -81,7 +91,7 @@ One shortcut to know: the steps below write commands starting with
 this folder, type `npx ` in front of each one — like the
 `npx wrangler login` you just ran.
 
-**1. Create the database.**
+### 1. Create the database
 
 ```bash
 wrangler d1 create lab-comments
@@ -90,7 +100,7 @@ wrangler d1 create lab-comments
 Wrangler prints a `database_id`. Copy it into a note — you will
 paste it in step 3.
 
-**2. Make the table (you can skip this one).**
+### 2. Make the table (you can skip this one)
 
 You can skip this step — the Worker creates the table on its own
 the first time it runs. This step is only for people who like
@@ -100,7 +110,7 @@ things set up ahead of time.
 wrangler d1 execute lab-comments --remote --file=./schema.sql
 ```
 
-**3. Connect the database to your site.**
+### 3. Connect the database to your site
 
 Copy `wrangler.toml.example` to `wrangler.toml`, put in your project
 name, and paste the `database_id` from step 1. Your project name is
@@ -112,7 +122,7 @@ No `wrangler.toml`? Do it in the Cloudflare dashboard instead: your
 Pages project → **Settings → Bindings → Add → D1 database**, variable
 name `DB`, pick the database from step 1.
 
-**4. Add the Worker.**
+### 4. Add the Worker
 
 Copy `worker.js` into the root of your Pages project and rename it to
 `_worker.js`. It answers `/api/comments` and passes everything else
@@ -122,7 +132,7 @@ through to your normal pages.
 > merge the two. The comment routes are the parts marked "comments"
 > in the file.
 
-**5. Add the comment box to a page.**
+### 5. Add the comment box to a page
 
 Copy `comments.css` and `comments.js` into your project, then put
 this where the comments should go:
@@ -137,7 +147,7 @@ The box builds itself — list, form, and all. Comments belong to the
 page they are posted on. To pin a box to one set page, write
 `<div id="lab-comments" data-path="/news/my-post"></div>`.
 
-**6. Deploy.**
+### 6. Deploy
 
 Put your Pages project online the way you always do. Open a page and
 post a test comment. A plain comment shows right away. A comment with
@@ -221,12 +231,18 @@ All settings sit at the top of the comments part of `worker.js`.
 | `COMMENT_DEDUPE_MINUTES` | 10 | Window in which the exact same comment (same page, name, and text) counts as a double-post and is answered instead of re-posted |
 | `COMMENT_HOLD_WORDS` | `viagra`, `cialis`, `casino`, `porn`, `escort`, `crypto giveaway`, `make money fast`, `free money`, `work from home scam` | Words that send a comment to the human-OK queue |
 | `COMMENT_LINK_RE` | built in | The pattern that spots a link in a comment |
+| `COMMENT_REPORT_RATE_MAX` | 10 | Reports per hour, per person |
+| `COMMENT_REPORT_HOLD_THRESHOLD` | 2 | Reports that send a showing comment back to the human-OK queue |
+| `COMMENTS_HOLD_FIRST` | `false` | When `true`, a person's first-ever comment waits for a human OK (hold reason `first`) |
+| `COMMENTS_GLOBAL_VELOCITY_MAX` | 10 | Comments across all pages in the velocity window that hold the next one (hold reason `velocity`) |
+| `COMMENTS_GLOBAL_VELOCITY_MINUTES` | 10 | The velocity window, in minutes |
 
 ## Checking and OK-ing held comments
 
 Held comments have the status `pending`. How often should you
 check? Once a day is fine — held comments simply wait, and nothing
-goes live until you OK it. And the first command below only *looks*
+goes live until you OK it. (The moderation queue further below is
+the same job on a web page, once you have set its token.) And the first command below only *looks*
 at the held comments. It changes nothing and cannot break anything.
 See them:
 
@@ -249,10 +265,172 @@ wrangler d1 execute lab-comments --remote \
   --command "DELETE FROM lab_comments WHERE id = 12;"
 ```
 
+## Reporting a comment (new in v2)
+
+Every comment on the page has a small **Report** button under it.
+Clicking it sends the comment's `id` to `POST /api/comments/report`.
+There is nothing else to fill in.
+
+- A report is recorded once per reader: the reports table keeps one
+  row per comment per scrambled address, so the same person clicking
+  again gets a quiet "already noted" (`{ok: true, duplicate: true}`)
+  and the count does not move.
+- One person can report at most **10 comments an hour**. Past that,
+  reports answer `429` with the error `rate_limited` — and the page
+  still thanks the reader, because flagging in good faith should
+  never feel like an error.
+- Each report adds 1 to the comment's `report_count`. When the
+  count reaches **2** and the comment is showing (`approved`), it is
+  set back to `pending` on the spot — it disappears from the page
+  until a person reads it again and OKs it (or rejects it) in the
+  moderation queue below.
+- Reports carry the same guards as comment posts: same-origin check,
+  `POST` + JSON only, the size cap, and the honeypot trap.
+
+## Hold-first mode (new in v2, off by default)
+
+At the top of the comments part of `worker.js` sits one switch:
+
+```js
+const COMMENTS_HOLD_FIRST = false;
+```
+
+Leave it `false` and nothing changes. Set it to `true` and a
+person's **first-ever comment** on your site — the first one from
+their scrambled address, in any state — waits for a human OK, with
+the hold reason `first`. The reader is told plainly: *"Thanks —
+first comments here get a quick read by a person before they
+appear."* Once that person has any comment stored at all, later
+comments follow the normal rules.
+
+**Production note:** this package ships with hold-first **off**,
+and off is the right default for most small sites — turning it on
+means every brand-new reader waits for you, so the queue becomes
+part of every first visit. Turn it on deliberately, for example
+during a spam wave, and remember it is on.
+
+## The global velocity watch (new in v2)
+
+The per-page flood brake watches one page. The velocity watch
+watches one *person* across **all** pages together:
+
+- If a scrambled address already has **10 comments in the last 10
+  minutes** across every page combined, the next comment is **held**
+  for a person (status `pending`, hold reason `velocity`) instead of
+  being shown — and instead of being refused. The reader is told:
+  *"Thanks — a person will read this one first."*
+- The thresholds are the `COMMENTS_GLOBAL_VELOCITY_MAX` (10) and
+  `COMMENTS_GLOBAL_VELOCITY_MINUTES` (10) settings at the top of
+  `worker.js`.
+- Nothing existing got weaker: the 5-an-hour limit, the per-page
+  burst brake, dedupe, and the link/word holds all still run. The
+  velocity watch is checked right after the hourly count, and it
+  only ever claims the comments that are moving far too fast for
+  the hourly limit alone to describe.
+
+## The moderation queue (new in v2)
+
+Held comments used to mean database commands (they still work —
+see "Checking and OK-ing held comments" above). The queue is the
+same job on a web page: it lists every `pending` comment with its
+page, name, text, time, and report count, each with **Approve** and
+**Reject** buttons. Approve sets the comment to `approved` (it
+shows); reject sets it to `rejected` (it never shows).
+
+The queue is gated by a secret token. **If the token is not set,
+the queue is off** and every queue address answers 403.
+
+### Set the token
+
+Pick a long, random token of your own. Never put it in `worker.js`
+or in this repo — it belongs in a Pages secret named
+`COMMENTS_MOD_TOKEN`.
+
+#### In the Cloudflare dashboard
+
+1. Open your Pages project → **Settings → Environment variables**.
+2. Add a variable named `COMMENTS_MOD_TOKEN`, paste your token as
+   the value, and encrypt it if Cloudflare offers the option.
+3. Deploy again so the Worker picks the secret up.
+
+#### With Wrangler
+
+```bash
+npx wrangler pages secret put COMMENTS_MOD_TOKEN
+```
+
+Wrangler asks for the value — paste your token there, not on the
+command line.
+
+### Open the queue
+
+```text
+https://your-site.example/api/comments/moderation?token=YOUR-TOKEN
+```
+
+Treat that address like a password — anyone who has it can approve
+and reject comments. The page itself calls two JSON endpoints with
+the token in an `x-mod-token` header (the endpoints also accept
+`?token=`):
+
+- `GET /api/comments/moderation/list` — the pending comments as
+  JSON: `{ok: true, pending: [{id, path, name, body, created_at,
+  report_count}], count}`.
+- `POST /api/comments/moderation/act` — send `{id, action}` with
+  `action` set to `"approve"` or `"reject"`; it answers
+  `{ok: true, status}` with the new status.
+
+A missing or wrong token gets `403` on all three addresses (the
+page answers plain text; the two JSON endpoints answer
+`{ok: false, error: "forbidden"}`).
+
+**The queue page is the alert surface.** There is **no email alert
+built in** — nothing will write to you when a comment is held or
+reported. Check the queue page daily, the same rhythm as the
+database commands above. A held comment simply waits; nothing goes
+live until you OK it.
+
+## Schema changes in v2
+
+Two changes, both in `schema.sql`, and the Worker makes both on its
+own the first time it runs (the column add is guarded, so older
+databases gain it without an error):
+
+- `lab_comments` gains a `report_count` column
+  (`INTEGER NOT NULL DEFAULT 0`).
+- A new `lab_comment_reports` table keeps one row per report —
+  `comment_id`, the reporter's scrambled address (`ip_hash`), and
+  `created_at` — with `UNIQUE(comment_id, ip_hash)` so one person
+  reporting the same comment twice is counted once.
+
+No existing rows change meaning: old comments start with a
+`report_count` of 0, and statuses mean what they always meant.
+
 ## Security notes
 
-- Posts are only accepted as `POST` + JSON, from your own site's
-  origin, under the size cap. Everything else gets a plain "no".
+- Posts are only accepted as `POST` + JSON, under the size cap. If
+  the browser sends an `Origin` header, **its host must match the
+  host the request was made to** — that is the exact check in
+  `worker.js` (`commentOriginOk`). Everything else gets a plain
+  "no".
+- **Requests with no `Origin` header are accepted.** That is a
+  plain trade-off, stated plainly: non-browser clients (a script, a
+  feed tool, a plain HTTP call) send no `Origin` at all, so refusing
+  them would break honest tools without stopping anyone determined
+  — an `Origin` header is easy to write by hand outside a browser.
+  The origin check is a browser guard, not proof of who sent a
+  post. The compensating controls are the rest of the design:
+  `POST` + JSON only, the size cap, the honeypot, the hourly and
+  per-page limits, and the human holds.
+- **The address fallback can be spoofed off Cloudflare.** The
+  Worker reads the poster's address from `cf-connecting-ip` first —
+  on Cloudflare, Cloudflare sets that header itself. Only when it
+  is **absent** does the Worker fall back to `x-forwarded-for`, and
+  a client can write anything it likes in `x-forwarded-for`. So on
+  a path that does not run behind Cloudflare, the scrambled address
+  (and every limit counted by it) can be faked. That is why the
+  per-page burst brake exists: it counts a page's comments from
+  everyone together and needs no address at all.
 - No string-built SQL. Every database call is a prepared statement
   with bound values, so a comment can never twist a database command.
 - The Worker sends a strong set of security headers on every response
