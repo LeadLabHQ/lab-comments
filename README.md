@@ -45,7 +45,7 @@ them around the web. This one does the opposite:
   are never stored.
 - **Readers can flag a comment.** Every comment carries a small
   **Report** button. A report is counted once per reader, and when
-  two readers report a comment that is showing, it goes back to
+  three readers report a comment that is showing, it goes back to
   waiting for a human OK. See "Reporting a comment" below.
 - **A flood brake across pages.** If one person posts 10 comments
   across *all* pages in 10 minutes, the next one waits for a human
@@ -280,10 +280,13 @@ There is nothing else to fill in.
   still thanks the reader, because flagging in good faith should
   never feel like an error.
 - Each report adds 1 to the comment's `report_count`. When the
-  count reaches **2** and the comment is showing (`approved`), it is
+  count reaches **3** — three different readers, since one reader
+  counts once — and the comment is showing (`approved`), it is
   set back to `pending` on the spot — it disappears from the page
   until a person reads it again and OKs it (or rejects it) in the
-  moderation queue below.
+  moderation queue below. (The threshold is 3, not 2, on purpose:
+  one person with a home network and a phone is two "readers", and
+  two networks alone should not be able to hide a comment.)
 - Reports carry the same guards as comment posts: same-origin check,
   `POST` + JSON only, the size cap, and the honeypot trap.
 
@@ -327,6 +330,11 @@ watches one *person* across **all** pages together:
   velocity watch is checked right after the hourly count, and it
   only ever claims the comments that are moving far too fast for
   the hourly limit alone to describe.
+- One precedence rule matters: the velocity hold only applies
+  while the poster is **under** the hourly limit. Once the hourly
+  limit is also hit, the answer is the hourly limit's `429` and
+  nothing more is stored — a flood cannot turn refusals into an
+  endless pile of held comments waiting in your queue.
 
 ## The moderation queue (new in v2)
 
@@ -370,8 +378,12 @@ https://your-site.example/api/comments/moderation?token=YOUR-TOKEN
 
 Treat that address like a password — anyone who has it can approve
 and reject comments. The page itself calls two JSON endpoints with
-the token in an `x-mod-token` header (the endpoints also accept
-`?token=`):
+the token in an `x-mod-token` header. The endpoints accept the
+token **only** in that header — the `?token=` form works on the
+queue page alone, so the token stays out of URLs (and logs and
+browser history) everywhere else. The token check itself is
+constant-time, and every queue response is sent with
+`Cache-Control: no-store`:
 
 - `GET /api/comments/moderation/list` — the pending comments as
   JSON: `{ok: true, pending: [{id, path, name, body, created_at,
@@ -440,6 +452,12 @@ No existing rows change meaning: old comments start with a
   or `connect-src` in `worker.js` — widen one thing at a time and test.
 - The page never inserts comment HTML. Keep it that way if you edit
   `comments.js`: text nodes only.
+- **IPv6 counts by the /64 block.** IPv6 addresses are handed out
+  in /64 blocks, and one person usually controls the whole block.
+  Before scrambling, an IPv6 address is reduced to its /64 prefix,
+  so rotating addresses inside a block does not mint a fresh
+  "person" for the hourly, report, and velocity limits. IPv4
+  addresses are used exactly as they arrive.
 - **Change the salt.** The scrambled addresses are hashed with the
   prefix `"lab-comments:"` (see `hashIp` in `worker.js`). Change it
   to a phrase of your own when you install. Then your site's

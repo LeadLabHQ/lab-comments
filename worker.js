@@ -96,7 +96,7 @@ const COMMENT_PATH_BURST_MAX = 20; // comments per page per 10 minutes, everyone
 const COMMENT_PATH_BURST_MINUTES = 10; // the burst window, in minutes
 const COMMENT_DEDUPE_MINUTES = 10; // exact-duplicate window (same page + name + text)
 const COMMENT_REPORT_RATE_MAX = 10; // reports per hour per person
-const COMMENT_REPORT_HOLD_THRESHOLD = 2; // reports that send an approved comment back to a person
+const COMMENT_REPORT_HOLD_THRESHOLD = 3; // reports (from 3 different readers) that send an approved comment back to a person
 
 // Hold-first mode. When this is true, a person's very first comment
 // on your site (the first one ever from their address, in any state —
@@ -193,11 +193,45 @@ function cleanCommentText(value, keepNewlines) {
   return s.trim();
 }
 
+// IPv6 addresses are handed out in /64 blocks: one person (or one
+// attacker) usually controls every address in their /64 and can
+// rotate through them freely. Per-person limits therefore key on
+// the /64 prefix for IPv6, so rotating inside the block does not
+// mint a fresh "person" per address. IPv4 addresses are used
+// exactly as they arrive.
+function normalizeIpForHash(rawIp) {
+  const value = String(rawIp || "").trim();
+  if (!value.includes(":")) return value; // IPv4 or a placeholder
+  // IPv4-mapped IPv6 (::ffff:203.0.113.7): key on the IPv4 part.
+  const mapped = value.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
+  if (mapped) return mapped[1];
+  // Expand "::" so the first four groups (the /64 prefix) are plain.
+  const halves = value.split("::");
+  let groups;
+  if (halves.length === 2) {
+    const left = halves[0] ? halves[0].split(":") : [];
+    const right = halves[1] ? halves[1].split(":") : [];
+    const missing = 8 - left.length - right.length;
+    if (missing < 0) return value;
+    groups = [...left, ...Array(missing).fill("0"), ...right];
+  } else {
+    groups = value.split(":");
+  }
+  if (groups.length !== 8) return value;
+  return (
+    groups
+      .slice(0, 4)
+      .map((g) => g.toLowerCase().padStart(4, "0"))
+      .join(":") + "::/64"
+  );
+}
+
 async function hashIp(request) {
-  const ip =
+  const rawIp =
     request.headers.get("cf-connecting-ip") ||
     request.headers.get("x-forwarded-for") ||
     "unknown";
+  const ip = normalizeIpForHash(rawIp);
   // PER-INSTALL SALT: the "lab-comments:" prefix below is the salt for
   // the address scramble. Change it to a word or phrase of your own
   // when you install — then your site's scrambled addresses can never
@@ -303,13 +337,16 @@ async function handleCommentsPost(request, env) {
       .first();
 
     // Global velocity watch: this person's comments on every page
-    // together in the last few minutes. This is checked here, right
-    // after the hourly count, because the hourly limit (5 an hour)
-    // would otherwise always answer first and the velocity hold
-    // could never be reached by a seeded or fast-moving flood. When
-    // the velocity count is over the line, the comment below is held
-    // for a person instead of refused — the hourly refusal only
-    // answers when the velocity watch has not already claimed it.
+    // together in the last few minutes. The count is taken here so
+    // the hold below can use it, but precedence is deliberate: the
+    // hourly refusal answers whenever the hourly cap is hit —
+    // including when the velocity watch has also tripped. An
+    // earlier version let a velocity trip convert every refusal
+    // into another pending insert, so a flood could fill the
+    // moderation queue forever without ever being refused. Now the
+    // velocity hold only claims a comment while its author is still
+    // under the hourly cap; past the cap the honest 429 below is
+    // the answer and nothing is stored.
     const velocity = await env.DB.prepare(
       "SELECT COUNT(*) AS n FROM lab_comments WHERE ip_hash = ? AND created_at >= datetime('now', ?)"
     )
@@ -318,7 +355,7 @@ async function handleCommentsPost(request, env) {
     const velocityHeld =
       velocity && typeof velocity.n === "number" && velocity.n >= COMMENTS_GLOBAL_VELOCITY_MAX;
 
-    if (!velocityHeld && recent && typeof recent.n === "number" && recent.n >= COMMENT_RATE_MAX) {
+    if (recent && typeof recent.n === "number" && recent.n >= COMMENT_RATE_MAX) {
       return json({
         ok: false,
         error: "rate_limited",
@@ -510,21 +547,54 @@ async function handleCommentsReport(request, env) {
 // The queue is gated by a secret token the site owner sets as the
 // COMMENTS_MOD_TOKEN environment variable (a Pages secret — never in
 // this file). If it is not set, the queue is off and every route
-// below answers 403. The token travels in the x-mod-token header,
-// or as ?token= on the queue page itself so the page can be opened
-// from a bookmark.
-function modTokenOk(request, env) {
+// below answers 403. Three hardening details:
+// - The comparison is constant-time (tokenEqual below), so a wrong
+//   guess leaks nothing about how close it was.
+// - The token travels in the x-mod-token header. A ?token= query
+//   value is accepted ONLY on the queue page itself, so the page
+//   can be opened from a bookmark; the list/act endpoints are
+//   header-only, which keeps the token out of URLs (browser
+//   history, logs) everywhere it does not have to be.
+// - Every moderation response — page, list, act, and their 403s —
+//   carries Cache-Control: no-store (modJson / the page responses).
+
+// Constant-time string comparison: the loop always runs the full
+// length, so response timing says nothing about the token.
+function tokenEqual(given, expected) {
+  if (typeof given !== "string" || typeof expected !== "string") return false;
+  if (given.length !== expected.length) return false;
+  let diff = 0;
+  for (let i = 0; i < given.length; i++) {
+    diff |= given.charCodeAt(i) ^ expected.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
+function modTokenOk(request, env, allowQueryToken = false) {
   const expected = env && typeof env.COMMENTS_MOD_TOKEN === "string"
     ? env.COMMENTS_MOD_TOKEN : "";
   if (!expected) return false;
-  const url = new URL(request.url);
-  const given = request.headers.get("x-mod-token") || url.searchParams.get("token") || "";
-  return given !== "" && given === expected;
+  let given = request.headers.get("x-mod-token") || "";
+  if (!given && allowQueryToken) {
+    given = new URL(request.url).searchParams.get("token") || "";
+  }
+  return given !== "" && tokenEqual(given, expected);
+}
+
+// JSON the way moderation routes answer: never stored, never cached.
+function modJson(body, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      "content-type": "application/json",
+      "cache-control": "no-store",
+    },
+  });
 }
 
 async function handleModerationList(request, env) {
   if (!modTokenOk(request, env)) {
-    return json({ ok: false, error: "forbidden" }, 403);
+    return modJson({ ok: false, error: "forbidden" }, 403);
   }
   try {
     await ensureCommentsTable(env);
@@ -532,36 +602,36 @@ async function handleModerationList(request, env) {
       "SELECT id, path, name, body, created_at, report_count FROM lab_comments WHERE status = 'pending' ORDER BY id ASC LIMIT 200"
     ).all();
     const pending = rows.results || [];
-    return json({ ok: true, pending, count: pending.length });
+    return modJson({ ok: true, pending, count: pending.length });
   } catch {
-    return json({ ok: false, error: "server" }, 500);
+    return modJson({ ok: false, error: "server" }, 500);
   }
 }
 
 async function handleModerationAct(request, env) {
   if (!modTokenOk(request, env)) {
-    return json({ ok: false, error: "forbidden" }, 403);
+    return modJson({ ok: false, error: "forbidden" }, 403);
   }
   try {
     const ctype = request.headers.get("content-type") || "";
     if (!ctype.toLowerCase().startsWith("application/json")) {
-      return json({ ok: false, error: "content_type" }, 415);
+      return modJson({ ok: false, error: "content_type" }, 415);
     }
     let body;
     try {
       body = JSON.parse(await request.text());
     } catch {
-      return json({ ok: false, error: "invalid" }, 400);
+      return modJson({ ok: false, error: "invalid" }, 400);
     }
     if (!body || typeof body !== "object") {
-      return json({ ok: false, error: "invalid" }, 400);
+      return modJson({ ok: false, error: "invalid" }, 400);
     }
     const id = Number(body.id);
     if (!Number.isInteger(id) || id <= 0) {
-      return json({ ok: false, error: "invalid" }, 400);
+      return modJson({ ok: false, error: "invalid" }, 400);
     }
     if (body.action !== "approve" && body.action !== "reject") {
-      return json({ ok: false, error: "invalid" }, 400);
+      return modJson({ ok: false, error: "invalid" }, 400);
     }
     const status = body.action === "approve" ? "approved" : "rejected";
     await ensureCommentsTable(env);
@@ -571,16 +641,16 @@ async function handleModerationAct(request, env) {
       .bind(id)
       .first();
     if (!comment) {
-      return json({ ok: false, error: "not_found" }, 404);
+      return modJson({ ok: false, error: "not_found" }, 404);
     }
     await env.DB.prepare(
       "UPDATE lab_comments SET status = ? WHERE id = ?"
     )
       .bind(status, id)
       .run();
-    return json({ ok: true, status });
+    return modJson({ ok: true, status });
   } catch {
-    return json({ ok: false, error: "server" }, 500);
+    return modJson({ ok: false, error: "server" }, 500);
   }
 }
 
@@ -588,10 +658,13 @@ async function handleModerationAct(request, env) {
 // text of its own — its script asks the list endpoint (with the token
 // from this page's own address) and draws each comment as text only.
 function handleModerationPage(request, env) {
-  if (!modTokenOk(request, env)) {
+  if (!modTokenOk(request, env, true)) {
     return new Response("Forbidden", {
       status: 403,
-      headers: { "content-type": "text/plain; charset=utf-8" },
+      headers: {
+        "content-type": "text/plain; charset=utf-8",
+        "cache-control": "no-store",
+      },
     });
   }
   const html = [
@@ -648,7 +721,10 @@ function handleModerationPage(request, env) {
   ].join("\n");
   return new Response(html, {
     status: 200,
-    headers: { "content-type": "text/html; charset=utf-8" },
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-store",
+    },
   });
 }
 

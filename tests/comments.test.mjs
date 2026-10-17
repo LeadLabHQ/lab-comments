@@ -216,7 +216,23 @@ async function modRequest(env, pathAndQuery, opts) {
   const text = await res.text();
   let data = null;
   try { data = JSON.parse(text); } catch { /* the queue page is HTML */ }
-  return { status: res.status, data, text };
+  return { status: res.status, data, text, headers: res.headers };
+}
+
+// A copy of the worker with the hourly cap raised far above the
+// velocity threshold, for the velocity-hold branch test (with the
+// production numbers the hourly cap always answers first — see
+// test 16).
+async function loadHighRateWorker() {
+  const src = readFileSync(workerPath, "utf-8");
+  const flipped = src.replace(
+    "const COMMENT_RATE_MAX = 5;", "const COMMENT_RATE_MAX = 50;");
+  if (flipped === src) throw new Error("hourly cap constant not found in worker source");
+  const p = path.join(tmpdir(), `lab-comments-worker-highrate-${process.pid}.mjs`);
+  writeFileSync(p, flipped);
+  const w = (await import(p)).default;
+  unlinkSync(p);
+  return w;
 }
 
 // A copy of the worker with hold-first switched on, for its tests.
@@ -356,8 +372,10 @@ console.log("worker under test:", workerPath);
 }
 
 // 13. Report flow: first report counts, the same person reporting
-//     again is idempotent, and a second person reporting sends an
-//     approved comment back to pending at the threshold of 2.
+//     again is idempotent, the second person does NOT hold (the
+//     threshold is 3 — one person with two networks must not be
+//     able to hide a comment), and the third person's report sends
+//     an approved comment back to pending.
 {
   const env = { DB: makeDb() };
   await post(env, { path: "/news/x", name: "Sam", body: "Report me." });
@@ -372,7 +390,13 @@ console.log("worker under test:", workerPath);
   const r3 = await report(env, id, "198.51.100.11");
   check("second person's report ok", r3.data.ok === true && !r3.data.duplicate, JSON.stringify(r3.data));
   check("report_count reaches 2", env.DB.rows[0].report_count === 2);
-  check("approved comment auto-held at 2 reports", env.DB.rows[0].status === "pending", env.DB.rows[0].status);
+  check("two reports do not hold (threshold is 3)", env.DB.rows[0].status === "approved", env.DB.rows[0].status);
+  const g2 = await get(env, "/news/x");
+  check("comment still shows at 2 reports", g2.data.comments.length === 1);
+  const r3b = await report(env, id, "198.51.100.12");
+  check("third person's report ok", r3b.data.ok === true && !r3b.data.duplicate, JSON.stringify(r3b.data));
+  check("report_count reaches 3", env.DB.rows[0].report_count === 3);
+  check("approved comment auto-held at 3 reports", env.DB.rows[0].status === "pending", env.DB.rows[0].status);
   const g = await get(env, "/news/x");
   check("auto-held comment hidden", g.data.comments.length === 0);
   const r4 = await report(env, 9999, "198.51.100.12");
@@ -417,10 +441,15 @@ console.log("worker under test:", workerPath);
   check("hold-first on: second comment approved", r2.data.status === "approved" && !r2.data.held, JSON.stringify(r2.data));
 }
 
-// 16. Global velocity watch: more than 10 comments from one person
-//     across different pages in the window (seeded directly, the way
-//     a flood that slipped past the hourly limit would look) — the
-//     next comment is held as velocity, not refused.
+// 16. Global velocity watch, both precedence branches (audit M2):
+//     (a) production numbers — a seeded flood of 10 in the window
+//         means the hourly cap (5) is also long past, so the next
+//         post gets the honest 429 and NOTHING is inserted: a flood
+//         can no longer convert refusals into an endless stream of
+//         pending rows in the queue.
+//     (b) under the hourly cap (exercised with the cap raised, the
+//         only consistent way to reach it) — the velocity hold
+//         claims the comment: held as velocity, never refused.
 {
   const env = { DB: makeDb() };
   const ip = "203.0.113.70";
@@ -429,11 +458,21 @@ console.log("worker under test:", workerPath);
     env.DB.seed({ path: "/news/v" + i, name: "Fast", body: "seeded " + i, ip_hash: ipHash });
   }
   const r = await post(env, { path: "/news/elsewhere", name: "Fast", body: "One more, somewhere new." }, ip);
-  check("velocity comment held, not refused", r.status === 200 && r.data.status === "pending" && r.data.held === "velocity",
+  check("velocity + hourly cap both tripped: 429 rate_limited", r.status === 429 && r.data.error === "rate_limited",
     JSON.stringify(r.data));
+  check("nothing inserted past the cap", env.DB.rows.length === 10, "rows=" + env.DB.rows.length);
+
+  const highRate = await loadHighRateWorker();
+  const env2 = { DB: makeDb() };
+  for (let i = 0; i < 10; i++) {
+    env2.DB.seed({ path: "/news/v" + i, name: "Fast", body: "seeded " + i, ip_hash: ipHash });
+  }
+  const r2 = await postWith(highRate, env2, { path: "/news/elsewhere", name: "Fast", body: "One more, somewhere new." }, ip);
+  check("velocity under the cap: held, not refused", r2.status === 200 && r2.data.status === "pending" && r2.data.held === "velocity",
+    JSON.stringify(r2.data));
   check("velocity comment stored as pending",
-    env.DB.rows[env.DB.rows.length - 1].status === "pending");
-  const g = await get(env, "/news/elsewhere");
+    env2.DB.rows[env2.DB.rows.length - 1].status === "pending");
+  const g = await get(env2, "/news/elsewhere");
   check("velocity comment hidden", g.data.comments.length === 0);
 }
 
@@ -456,12 +495,21 @@ console.log("worker under test:", workerPath);
     list.data.pending[0].name === "Sam" && list.data.pending[0].report_count === 0 &&
     typeof list.data.pending[0].created_at === "string", JSON.stringify(list.data.pending[0]));
   const listQuery = await modRequest(env, "/api/comments/moderation/list?token=test-mod-token");
-  check("list also accepts ?token=", listQuery.status === 200 && listQuery.data.count === 1);
+  check("list rejects ?token= (header-only)", listQuery.status === 403 && listQuery.data.error === "forbidden",
+    JSON.stringify(listQuery.data));
+  check("list answer is no-store", (list.headers.get("cache-control") || "").includes("no-store"),
+    list.headers.get("cache-control"));
+  check("forbidden list answer is no-store", (noTok.headers.get("cache-control") || "").includes("no-store"),
+    noTok.headers.get("cache-control"));
 
   const pageNo = await modRequest(env, "/api/comments/moderation");
   check("queue page without token is 403", pageNo.status === 403, "status=" + pageNo.status);
+  check("queue page 403 is no-store", (pageNo.headers.get("cache-control") || "").includes("no-store"),
+    pageNo.headers.get("cache-control"));
   const page = await modRequest(env, "/api/comments/moderation?token=test-mod-token");
-  check("queue page with token loads", page.status === 200 && page.text.includes("Comments waiting for a person"), "status=" + page.status);
+  check("queue page with ?token= loads (page only)", page.status === 200 && page.text.includes("Comments waiting for a person"), "status=" + page.status);
+  check("queue page is no-store", (page.headers.get("cache-control") || "").includes("no-store"),
+    page.headers.get("cache-control"));
   check("queue page talks to the list and act endpoints",
     page.text.includes("/api/comments/moderation/list") && page.text.includes("/api/comments/moderation/act"));
 
@@ -469,11 +517,18 @@ console.log("worker under test:", workerPath);
     { method: "POST", tokenHeader: "wrong", body: { id: pendingId, action: "approve" } });
   check("act with wrong token is 403", actBad.status === 403 && actBad.data.error === "forbidden", JSON.stringify(actBad.data));
   check("bad-token act changed nothing", env.DB.rows[0].status === "pending");
+  const actQuery = await modRequest(env, "/api/comments/moderation/act?token=test-mod-token",
+    { method: "POST", body: { id: pendingId, action: "approve" } });
+  check("act rejects ?token= (header-only)", actQuery.status === 403 && actQuery.data.error === "forbidden",
+    JSON.stringify(actQuery.data));
+  check("query-token act changed nothing", env.DB.rows[0].status === "pending");
 
   const approve = await modRequest(env, "/api/comments/moderation/act",
     { method: "POST", tokenHeader: "test-mod-token", body: { id: pendingId, action: "approve" } });
   check("approve answers the new status", approve.status === 200 && approve.data.ok === true && approve.data.status === "approved",
     JSON.stringify(approve.data));
+  check("act answer is no-store", (approve.headers.get("cache-control") || "").includes("no-store"),
+    approve.headers.get("cache-control"));
   check("approved row updated", env.DB.rows[0].status === "approved");
   const g = await get(env, "/news/x");
   check("approved comment now shows", g.data.comments.length === 1);
@@ -503,6 +558,31 @@ console.log("worker under test:", workerPath);
     { method: "POST", tokenHeader: "anything", body: { id, action: "approve" } });
   check("unset token: act is 403", act.status === 403 && act.data.error === "forbidden");
   check("unset token: nothing changed", env.DB.rows[0].status === "pending");
+}
+
+// 19. IPv6 /64 keying (audit L2): addresses inside one /64 are one
+//     "person" for the hourly limit — rotating the interface part
+//     does not mint a fresh allowance — while a different /64 is a
+//     different person.
+{
+  const env = { DB: makeDb() };
+  const block = "2001:db8:85a3:1111";
+  for (let i = 0; i < 5; i++) {
+    const r = await post(env, { path: "/news/p" + i, name: "V6", body: "post " + i }, block + "::" + (i + 1));
+    check("ipv6 post " + (i + 1) + " approved", r.data.status === "approved", JSON.stringify(r.data));
+  }
+  const r6 = await post(env, { path: "/news/other", name: "V6", body: "sixth, rotated address" }, block + "::99");
+  check("6th from the same /64 is rate_limited", r6.status === 429 && r6.data.error === "rate_limited", JSON.stringify(r6.data));
+  const rOther = await post(env, { path: "/news/other", name: "V6", body: "different block" }, "2001:db8:85a3:2222::1");
+  check("a different /64 is a different person", rOther.data.status === "approved", JSON.stringify(rOther.data));
+  // The unexpanded "::" form of the same block keys identically.
+  const env2 = { DB: makeDb() };
+  for (let i = 0; i < 5; i++) {
+    await post(env2, { path: "/news/p" + i, name: "V6", body: "post " + i }, "2001:db8:85a3:1111:0:0:0:" + (i + 1));
+  }
+  const r6b = await post(env2, { path: "/news/other", name: "V6", body: "sixth, compressed form" }, block + "::99");
+  check("expanded and compressed forms share the /64 key", r6b.status === 429 && r6b.data.error === "rate_limited",
+    JSON.stringify(r6b.data));
 }
 
 console.log(failures ? `\n${failures} FAILURES` : "\nALL TESTS PASSED");
